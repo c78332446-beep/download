@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Telegram Video Downloader Bot</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+
+      body {
+        display: grid;
+        min-height: 100vh;
+        margin: 0;
+        place-items: center;
+      }
+
+      main {
+        width: min(42rem, calc(100% - 3rem));
+        padding: 2.5rem;
+        border: 1px solid #334155;
+        border-radius: 1rem;
+        background: #1e293b;
+        box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 25%);
+      }
+
+      h1 {
+        margin-top: 0;
+        color: #f8fafc;
+      }
+
+      p {
+        line-height: 1.65;
+      }
+
+      code {
+        padding: 0.15rem 0.35rem;
+        border-radius: 0.3rem;
+        background: #0f172a;
+      }
+
+      .ready {
+        color: #4ade80;
+        font-weight: 700;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="ready">Deployment ready</p>
+      <h1>Telegram Video Downloader Bot</h1>
+      <p>
+        The repository passed its deployment build. The Telegram bot is a
+        persistent Docker worker and should be run with the included Railway or
+        Render configuration and a <code>BOT_TOKEN</code> environment variable.
+      </p>
+    </main>
+  </body>
+</html>
