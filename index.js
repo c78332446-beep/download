@@ -15,6 +15,14 @@ import {
   REDNOTE_MOBILE_HEADERS,
 } from "./rednote.js";
 import { resolveFinalUrl as resolveHttpFinalUrl } from "./url-resolver.js";
+import {
+  DOUYIN_MOBILE_SHARE_HEADERS,
+  downloadDouyinDirectFileWithRetry,
+  getDouyinFallbackSources as fetchDouyinFallbackSources,
+  isDouyinUrl,
+} from "./douyin.js";
+import { downloadDirectFile as fetchDirectFile } from "./media-download.js";
+import { extractUrls } from "./share-links.js";
 
 // Load environment variables from .env
 // Required: BOT_TOKEN
@@ -67,6 +75,7 @@ if (!/^\d+:[\w-]+$/.test(BOT_TOKEN)) {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const isEntryPoint = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === __filename;
 
 const DOWNLOAD_DIR = path.join(__dirname, "downloads");
 const TELEGRAM_CLOUD_LIMIT_BYTES = 50 * 1024 * 1024; // 50MB on default Bot API server
@@ -99,14 +108,6 @@ const RESOLVE_HEADERS = {
     "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 };
-const DOUYIN_MOBILE_SHARE_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36",
-  Accept: RESOLVE_HEADERS.Accept,
-  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-  Referer: "https://www.douyin.com/",
-};
 const KUAISHOU_MOBILE_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 " +
@@ -115,8 +116,8 @@ const KUAISHOU_MOBILE_HEADERS = {
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 };
 
-// Initialize Telegram bot with polling.
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Importing the handlers for tests must not start a second polling process.
+const bot = new TelegramBot(BOT_TOKEN, { polling: isEntryPoint });
 const pendingSelections = new Map();
 const activeSelectionByChat = new Map();
 let isShuttingDown = false;
@@ -141,16 +142,6 @@ async function shutdown(signal) {
   }
 
   process.exit(0);
-}
-
-function extractUrls(text) {
-  const matches = text.match(/https?:\/\/[^\s]+/gi) || [];
-
-  const cleaned = matches
-    .map((value) => value.replace(/[)\]}",.!?，。；：”’]+$/g, ""))
-    .filter(Boolean);
-
-  return [...new Set(cleaned)];
 }
 
 function extractFirstUrl(text) {
@@ -182,28 +173,6 @@ function isKuaishouShortVideoUrl(url) {
 
 function isKuaishouUrl(url) {
   return /(?:^|\/\/)(?:v\.kuaishou\.com|(?:www\.)?kuaishou\.com)\//i.test(url);
-}
-
-function isDouyinShortUrl(url) {
-  return /(?:^|\/\/)v\.douyin\.com\//i.test(url);
-}
-
-function isDouyinSharePageUrl(url) {
-  return /(?:^|\/\/)(?:www\.)?iesdouyin\.com\/share\/video\//i.test(url);
-}
-
-function isDouyinUrl(url) {
-  return /(?:^|\/\/)(?:v\.douyin\.com|(?:www\.)?douyin\.com|(?:www\.)?iesdouyin\.com)\//i.test(url);
-}
-
-function extractDouyinVideoId(url) {
-  if (typeof url !== "string") return null;
-
-  const videoId =
-    url.match(/douyin\.com\/video\/(\d+)(?:[/?#]|$)/i)?.[1] ||
-    url.match(/iesdouyin\.com\/share\/video\/(\d+)(?:[/?#]|$)/i)?.[1];
-
-  return videoId || null;
 }
 
 function isTikTokUrl(url) {
@@ -335,32 +304,6 @@ function getBestDirectChoiceIndex(choices = []) {
   }
 
   return bestIndex;
-}
-
-function formatDouyinSourceLabel(video = {}) {
-  const width = Number(video?.width || 0);
-  const height = Number(video?.height || 0);
-  const shortEdge = Math.min(width || 0, height || 0);
-  if (shortEdge > 0) {
-    return `${shortEdge}p`;
-  }
-
-  const firstUrl = Array.isArray(video?.play_addr?.url_list) ? video.play_addr.url_list[0] : null;
-  if (typeof firstUrl === "string") {
-    try {
-      const ratio = new URL(firstUrl).searchParams.get("ratio");
-      if (ratio) return ratio;
-    } catch {
-      // Ignore malformed URLs and fall back to a generic label.
-    }
-  }
-
-  return "Default";
-}
-
-function normalizeDouyinPlayUrl(url) {
-  if (typeof url !== "string" || !url.startsWith("http")) return null;
-  return url.replace("/playwm/", "/play/");
 }
 
 function extractKuaishouSourcesFromHtml(html) {
@@ -682,6 +625,7 @@ async function downloadDirectChoice(choice, filePath) {
       await downloadDirectFile(url, filePath, choice.headers);
       return;
     } catch (error) {
+      if (error.code === "MEDIA_TOO_LARGE") throw error;
       lastError = error;
       log(`[direct] Source failed, trying next candidate: ${error.message}`);
     }
@@ -746,150 +690,27 @@ async function downloadRedNoteDirectFileWithRetry(selection, choice, filePath) {
   }
 }
 
-function buildDouyinShareCandidates(inputUrl, finalUrl) {
-  const candidates = [];
-  const videoId = extractDouyinVideoId(finalUrl) || extractDouyinVideoId(inputUrl);
-
-  if (videoId) {
-    candidates.push(`https://www.iesdouyin.com/share/video/${videoId}/`);
-  }
-
-  for (const candidate of [inputUrl, finalUrl]) {
-    if (!candidate) continue;
-    if (isDouyinShortUrl(candidate) || isDouyinSharePageUrl(candidate)) {
-      candidates.push(candidate);
-    }
-  }
-
-  return [...new Set(candidates)];
-}
-
-function extractDouyinSourcesFromHtml(html) {
-  const routerDataMatch = html.match(
-    /window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/i
-  );
-  if (!routerDataMatch) {
-    throw new Error("Douyin fallback could not find router data in share page.");
-  }
-
-  let routerData;
-  try {
-    routerData = JSON.parse(routerDataMatch[1]);
-  } catch (error) {
-    throw new Error(`Douyin fallback router data parse failed: ${error.message}`);
-  }
-
-  const loaderValues = Object.values(routerData?.loaderData || {});
-  const pageData = loaderValues.find((entry) =>
-    Array.isArray(entry?.videoInfoRes?.item_list)
-  );
-  const item = pageData?.videoInfoRes?.item_list?.find((entry) =>
-    Array.isArray(entry?.video?.play_addr?.url_list) && entry.video.play_addr.url_list.length > 0
-  );
-
-  if (!item) {
-    throw new Error("Douyin fallback page does not contain a playable video.");
-  }
-
-  const playUrls = item.video.play_addr.url_list
-    .map((value) => normalizeDouyinPlayUrl(value))
-    .filter((value, index, values) => value && values.indexOf(value) === index);
-
-  if (playUrls.length === 0) {
-    throw new Error("Douyin fallback could not extract a direct play URL.");
-  }
-
-  const label = formatDouyinSourceLabel(item.video);
-  const sources = playUrls.map((directUrl) => ({
-    label,
-    directUrl,
-    headers: DOUYIN_MOBILE_SHARE_HEADERS,
-  }));
-
-  const coverUrls = Array.isArray(item?.video?.cover?.url_list)
-    ? item.video.cover.url_list.filter((value) => typeof value === "string" && value.startsWith("http"))
-    : [];
-  const thumbnailUrl = coverUrls.length > 0 ? coverUrls[coverUrls.length - 1] : null;
-
-  return {
-    sources,
-    thumbnailUrl,
-  };
-}
-
-async function getDouyinFallbackSources(inputUrl, finalUrl) {
-  const candidates = buildDouyinShareCandidates(inputUrl, finalUrl);
-  if (candidates.length === 0) {
-    throw new Error("Douyin fallback could not determine a share page URL.");
-  }
-
-  let lastError = null;
-
-  for (const candidateUrl of candidates) {
-    try {
-      log(`[fallback] Douyin page parse start: ${candidateUrl}`);
-      const response = await axios({
-        method: "GET",
-        url: candidateUrl,
-        timeout: REDIRECT_TIMEOUT_MS,
-        maxRedirects: 10,
-        headers: DOUYIN_MOBILE_SHARE_HEADERS,
-        validateStatus: () => true,
-      });
-
-      if (response.status >= 400 || typeof response.data !== "string") {
-        throw new Error(`Douyin fallback page fetch failed (status ${response.status}).`);
-      }
-
-      const extracted = extractDouyinSourcesFromHtml(response.data);
-      log(`[fallback] Douyin play URL extracted (${extracted.sources.length} source(s)).`);
-      return extracted;
-    } catch (error) {
-      lastError = error;
-      log(`[fallback] Douyin candidate failed for ${candidateUrl}: ${error.message}`);
-    }
-  }
-
-  throw lastError || new Error("Douyin fallback could not extract a playable video.");
-}
-
-async function downloadDirectFile(url, filePath, requestHeaders = undefined) {
-  const response = await axios({
-    method: "GET",
-    url,
-    responseType: "stream",
-    timeout: 60000,
-    headers: {
-      ...RESOLVE_HEADERS,
-      ...(requestHeaders || {}),
-    },
-    validateStatus: (status) => status >= 200 && status < 300,
+function getDouyinFallbackSources(inputUrl, finalUrl) {
+  return fetchDouyinFallbackSources(inputUrl, finalUrl, {
+    timeoutMs: REDIRECT_TIMEOUT_MS,
+    logger: log,
+    cookie: process.env.DOUYIN_COOKIE?.trim() || "",
   });
+}
 
-  await new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(filePath);
-    let settled = false;
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      response.data.unpipe(writer);
-      response.data.destroy();
-      writer.destroy();
-      reject(error);
-    };
-
-    writer.on("finish", finish);
-    writer.on("error", fail);
-    response.data.on("error", fail);
-
-    response.data.pipe(writer);
+function downloadDouyinDirectFile(selection, choice, filePath) {
+  return downloadDouyinDirectFileWithRetry(selection, choice, filePath, {
+    download: downloadDirectChoice,
+    getSources: getDouyinFallbackSources,
+    logger: log,
   });
+}
+
+function downloadDirectFile(url, filePath, requestHeaders) {
+  return fetchDirectFile(url, filePath, {
+    ...RESOLVE_HEADERS,
+    ...(requestHeaders || {}),
+  }, { maxBytes: MAX_DOWNLOAD_BYTES });
 }
 
 function getFfmpegBinary() {
@@ -1247,19 +1068,16 @@ function isCookieLoadError(errorText) {
   );
 }
 
-function isDouyinFreshCookieError(errorText) {
-  return /fresh cookies .* needed/i.test(errorText);
-}
-
 async function ensureDownloadDir() {
   await fsp.mkdir(DOWNLOAD_DIR, { recursive: true });
 }
 
 async function resolveFinalUrl(inputUrl) {
   return resolveHttpFinalUrl(inputUrl, {
-    headers: isRedNoteUrl(inputUrl) ? REDNOTE_MOBILE_HEADERS : RESOLVE_HEADERS,
+    headers: isRedNoteUrl(inputUrl) ? REDNOTE_MOBILE_HEADERS :
+      isDouyinUrl(inputUrl) ? DOUYIN_MOBILE_SHARE_HEADERS : RESOLVE_HEADERS,
     timeoutMs: REDIRECT_TIMEOUT_MS,
-    skipHead: isRedNoteUrl(inputUrl),
+    skipHead: isRedNoteUrl(inputUrl) || isDouyinUrl(inputUrl),
     logger: log,
   });
 }
@@ -1655,16 +1473,19 @@ async function handleSelectionDownload(
       isRedNoteUrl(selection.originalUrl) ||
       isRedNoteUrl(selection.finalUrl);
 
-    const downloadFromFreshRedNoteSource = async (downloadKind) => {
-      const refreshed = await getRedNoteFallbackSources(
-        selection.originalUrl,
-        selection.finalUrl,
-        {
+    const isDouyinSelection = isDouyinUrl(selection.originalUrl) || isDouyinUrl(selection.finalUrl);
+    const platform = isDouyinSelection ? "Douyin" : "RedNote";
+    const downloadFreshDirectFile = isDouyinSelection
+      ? downloadDouyinDirectFile
+      : downloadRedNoteDirectFileWithRetry;
+    const downloadFromFreshPlatformSource = async (downloadKind) => {
+      const refreshed = isDouyinSelection
+        ? await getDouyinFallbackSources(selection.originalUrl, selection.finalUrl)
+        : await getRedNoteFallbackSources(selection.originalUrl, selection.finalUrl, {
           timeoutMs: REDIRECT_TIMEOUT_MS,
           logger: log,
-        }
-      );
-      if (refreshed.pageUrl && isRedNoteUrl(refreshed.pageUrl)) {
+        });
+      if (refreshed.pageUrl && (isRedNoteUrl(refreshed.pageUrl) || isDouyinUrl(refreshed.pageUrl))) {
         selection.finalUrl = refreshed.pageUrl;
       }
 
@@ -1673,14 +1494,14 @@ async function handleSelectionDownload(
         ? refreshedChoices[getBestDirectChoiceIndex(refreshedChoices)]
         : pickMatchingDirectChoice(choice, refreshedChoices);
       if (!selectedDirectChoice?.directUrl) {
-        throw new Error("RedNote fallback did not provide a matching media source.");
+        throw new Error(`${platform} fallback did not provide a matching media source.`);
       }
 
       if (downloadKind === "audio") {
         const sourceVideoPath = path.join(DOWNLOAD_DIR, `${baseName}.source.mp4`);
         temporaryFilePaths.push(sourceVideoPath);
         downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp3`);
-        await downloadRedNoteDirectFileWithRetry(
+        await downloadFreshDirectFile(
           selection,
           {
             ...selectedDirectChoice,
@@ -1694,7 +1515,7 @@ async function handleSelectionDownload(
       }
 
       downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp4`);
-      await downloadRedNoteDirectFileWithRetry(
+      await downloadFreshDirectFile(
         selection,
         selectedDirectChoice,
         downloadedFilePath
@@ -1717,6 +1538,8 @@ async function handleSelectionDownload(
         isRedNoteUrl(selection.finalUrl)
       ) {
         await downloadRedNoteDirectFileWithRetry(selection, choice, sourceVideoPath);
+      } else if (isDouyinSelection) {
+        await downloadDouyinDirectFile(selection, choice, sourceVideoPath);
       } else {
         await downloadDirectChoice(choice, sourceVideoPath);
       }
@@ -1730,6 +1553,8 @@ async function handleSelectionDownload(
         isRedNoteUrl(selection.finalUrl)
       ) {
         await downloadRedNoteDirectFileWithRetry(selection, choice, downloadedFilePath);
+      } else if (isDouyinSelection) {
+        await downloadDouyinDirectFile(selection, choice, downloadedFilePath);
       } else {
         await downloadDirectChoice(choice, downloadedFilePath);
       }
@@ -1749,22 +1574,22 @@ async function handleSelectionDownload(
           ".aac",
         ]);
       } catch (error) {
-        if (!isRedNoteSelection) throw error;
+        if (!isRedNoteSelection && !isDouyinSelection) throw error;
         log(
-          `[fallback] RedNote yt-dlp audio download failed; switching to direct source. ${error.message}`
+          `[fallback] ${platform} yt-dlp audio download failed; switching to direct source. ${error.message}`
         );
-        await downloadFromFreshRedNoteSource("audio");
+        await downloadFromFreshPlatformSource("audio");
       }
     } else {
       try {
         await runYtDlpDownload(sourceUrl, outputTemplate, choice.formatSelector, "video");
         downloadedFilePath = await findDownloadedFile(baseName, [".mp4"]);
       } catch (error) {
-        if (!isRedNoteSelection) throw error;
+        if (!isRedNoteSelection && !isDouyinSelection) throw error;
         log(
-          `[fallback] RedNote yt-dlp video download failed; switching to direct source. ${error.message}`
+          `[fallback] ${platform} yt-dlp video download failed; switching to direct source. ${error.message}`
         );
-        await downloadFromFreshRedNoteSource("video");
+        await downloadFromFreshPlatformSource("video");
       }
     }
 
@@ -1855,6 +1680,27 @@ async function handleSelectionDownload(
 
 function getFriendlyErrorMessage(errorText) {
   const text = errorText.toLowerCase();
+
+  if (text.includes("douyin")) {
+    if (text.includes("photo-only")) {
+      return "This Douyin post contains photos but no downloadable video.";
+    }
+    if (text.includes("share link did not resolve")) {
+      return "This Douyin link did not lead to a video. Copy a fresh video share link from the Douyin app and send it again.";
+    }
+    if (text.includes("public video stream") || text.includes("fresh cookies") ||
+        text.includes("video data") || text.includes("playable video")) {
+      return "Douyin did not provide an accessible video. Try a fresh share link; the video may require a browser session or be restricted in this server's region.";
+    }
+  }
+
+  if (text.includes("configured download limit")) {
+    return `This video exceeds the configured download limit of ${MAX_DOWNLOAD_MB}MB. Choose a smaller quality.`;
+  }
+
+  if (text.includes("web page instead of a video") || text.includes("empty video")) {
+    return "The media link returned no video or an access-check page. Send the original share link again to refresh it.";
+  }
 
   if (text.includes("unsupported url")) {
     return "This link format is not currently supported by yt-dlp.";
@@ -1964,6 +1810,16 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
     let choices = [];
     let previewImageUrl = null;
     let ytdlpUrl = finalUrl;
+    let triedDouyinFallback = false;
+
+    const useDouyinFallback = async () => {
+      triedDouyinFallback = true;
+      const fallback = await getDouyinFallbackSources(extractedUrl, finalUrl);
+      choices = mapDirectSourcesToChoices(fallback.sources);
+      previewImageUrl ||= fallback.thumbnailUrl;
+      if (fallback.pageUrl && isDouyinUrl(fallback.pageUrl)) finalUrl = fallback.pageUrl;
+      sourceType = "direct";
+    };
 
     const useRedNoteFallback = async () => {
       const fallback = await getRedNoteFallbackSources(extractedUrl, finalUrl, {
@@ -2010,12 +1866,7 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
 
       if (choices.length === 0 && shouldTryDouyinFallback) {
         log("[fallback] Triggered for Douyin URL with empty yt-dlp quality list.");
-        const { sources, thumbnailUrl } = await getDouyinFallbackSources(extractedUrl, finalUrl);
-        choices = mapDirectSourcesToChoices(sources);
-        if (!previewImageUrl) {
-          previewImageUrl = thumbnailUrl;
-        }
-        sourceType = "direct";
+        await useDouyinFallback();
       }
 
       if (choices.length === 0 && shouldTryTikTokFallback) {
@@ -2044,15 +1895,9 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
         choices = mapDirectSourcesToChoices(sources);
         previewImageUrl = thumbnailUrl;
         sourceType = "direct";
-      } else if (
-        (isUnsupportedUrlError(errorText) || isDouyinFreshCookieError(errorText)) &&
-        shouldTryDouyinFallback
-      ) {
+      } else if (shouldTryDouyinFallback && !triedDouyinFallback) {
         log("[fallback] Triggered for Douyin URL after yt-dlp failure.");
-        const { sources, thumbnailUrl } = await getDouyinFallbackSources(extractedUrl, finalUrl);
-        choices = mapDirectSourcesToChoices(sources);
-        previewImageUrl = thumbnailUrl;
-        sourceType = "direct";
+        await useDouyinFallback();
       } else if (shouldTryTikTokFallback) {
         log("[fallback] Triggered for TikTok URL after yt-dlp failure.");
         const { sources, thumbnailUrl } = await getTikTokFallbackSources(extractedUrl, finalUrl);
@@ -2273,13 +2118,13 @@ bot.on("polling_error", (error) => {
   log(`[polling_error] ${error?.message || String(error)}`);
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
+for (const signal of isEntryPoint ? ["SIGINT", "SIGTERM"] : []) {
   process.once(signal, () => {
     void shutdown(signal);
   });
 }
 
-(async () => {
+if (isEntryPoint) (async () => {
   await ensureDownloadDir();
 
   // Startup diagnostics
@@ -2308,3 +2153,5 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   log(`[startup_error] ${errorText}`);
   process.exit(1);
 });
+
+export { bot, getFriendlyErrorMessage, handleSelectionDownload, processIncomingUrl };

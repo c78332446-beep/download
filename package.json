@@ -5,8 +5,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "build": "node --check index.js && node --check rednote.js && node --check url-resolver.js",
-    "test": "node --test",
+    "build": "node --check index.js && node --check rednote.js && node --check douyin.js && node --check media-download.js && node --check share-links.js && node --check url-resolver.js",
+    "test": "node --test test/bot-douyin.test.js test/douyin.test.js test/media-download.test.js test/rednote.test.js",
     "start": "node index.js"
   },
   "engines": {
