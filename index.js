@@ -23,6 +23,7 @@ import {
 } from "./douyin.js";
 import { downloadDirectFile as fetchDirectFile } from "./media-download.js";
 import { extractUrls } from "./share-links.js";
+import { getDouyinBrowserSources } from "./douyin-browser.js";
 
 // Load environment variables from .env
 // Required: BOT_TOKEN
@@ -82,6 +83,7 @@ const TELEGRAM_CLOUD_LIMIT_BYTES = 50 * 1024 * 1024; // 50MB on default Bot API 
 const MAX_DOWNLOAD_MB = readPositiveNumberEnv("MAX_DOWNLOAD_MB", 200);
 const MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024;
 const AUTO_DOWNLOAD = String(process.env.AUTO_DOWNLOAD ?? "true").trim().toLowerCase() !== "false";
+const BOT_POLLING_ENABLED = String(process.env.BOT_POLLING_ENABLED ?? "true").trim().toLowerCase() !== "false";
 const REDIRECT_TIMEOUT_MS = 15000;
 const SELECTION_TTL_MS = 10 * 60 * 1000;
 
@@ -117,7 +119,7 @@ const KUAISHOU_MOBILE_HEADERS = {
 };
 
 // Importing the handlers for tests must not start a second polling process.
-const bot = new TelegramBot(BOT_TOKEN, { polling: isEntryPoint });
+const bot = new TelegramBot(BOT_TOKEN, { polling: isEntryPoint && BOT_POLLING_ENABLED });
 const pendingSelections = new Map();
 const activeSelectionByChat = new Map();
 let isShuttingDown = false;
@@ -695,6 +697,9 @@ function getDouyinFallbackSources(inputUrl, finalUrl) {
     timeoutMs: REDIRECT_TIMEOUT_MS,
     logger: log,
     cookie: process.env.DOUYIN_COOKIE?.trim() || "",
+    browserFallback: String(process.env.DOUYIN_BROWSER_FALLBACK ?? "true").trim().toLowerCase() === "false"
+      ? undefined
+      : (videoId) => getDouyinBrowserSources(videoId, { logger: log, proxyUrl: YTDLP_PROXY }),
   });
 }
 
@@ -2128,7 +2133,7 @@ if (isEntryPoint) (async () => {
   await ensureDownloadDir();
 
   // Startup diagnostics
-  log(`[startup] Bot started with polling.`);
+  log(`[startup] Telegram polling=${BOT_POLLING_ENABLED ? "enabled" : "disabled"}.`);
   log(`[startup] YTDLP_PATH=${YTDLP_PATH}`);
   log(`[startup] FFMPEG_LOCATION=${FFMPEG_LOCATION || "(not set)"}`);
   log(`[startup] YTDLP_JS_RUNTIMES=${YTDLP_JS_RUNTIMES || "(not set)"}`);
@@ -2136,6 +2141,8 @@ if (isEntryPoint) (async () => {
   log(`[startup] COOKIES_FROM_BROWSER=${COOKIES_FROM_BROWSER || "(not set)"}`);
   log(`[startup] MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB}`);
   log(`[startup] AUTO_DOWNLOAD=${AUTO_DOWNLOAD}`);
+  log(`[startup] DOUYIN_BROWSER_FALLBACK=${String(process.env.DOUYIN_BROWSER_FALLBACK ?? "true").trim().toLowerCase() !== "false"}`);
+  log(`[startup] BUILD_REVISION=${process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RENDER_GIT_COMMIT || "local"}`);
 
   // Helpful warning for Windows users when using local yt-dlp.exe path.
   if (

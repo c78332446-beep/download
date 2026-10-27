@@ -16,3 +16,5 @@ services:
         value: "200"
       - key: AUTO_DOWNLOAD
         value: "true"
+      - key: DOUYIN_BROWSER_FALLBACK
+        value: "true"

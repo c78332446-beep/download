@@ -155,6 +155,7 @@ export async function getDouyinFallbackSources(inputUrl, finalUrl, {
   logger = () => {},
   httpClient = axios,
   cookie = "",
+  browserFallback,
 } = {}) {
   let videoId = extractDouyinVideoId(inputUrl) || extractDouyinVideoId(finalUrl);
   const candidates = [...new Set([
@@ -212,6 +213,15 @@ export async function getDouyinFallbackSources(inputUrl, finalUrl, {
         failures.push(error.message);
         logger(`[fallback] Douyin API failed: ${error.message}`);
       }
+    }
+  }
+  if (videoId && browserFallback) {
+    try {
+      return await browserFallback(videoId);
+    } catch (error) {
+      if (/photo-only/.test(error.message)) throw error;
+      failures.push(error.message);
+      logger(`[fallback] Douyin browser failed: ${error.message}`);
     }
   }
   logger(`[fallback] Douyin extraction failed: ${failures.join(" | ")}`);
