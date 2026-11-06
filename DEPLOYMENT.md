@@ -39,13 +39,18 @@ rather than only its preview, is returned.
 
 ## Download recovery
 
-RedNote downloads prefer the original asset, then try the available playback
-qualities and their CDN backups if it is blocked. If every cached stream fails,
-the bot refreshes the share page once and retries the newly extracted sources.
-Audio and later HD downloads reuse the working stream. Failed manual downloads
-keep their buttons usable until the selection expires.
+RedNote downloads require the original asset identified by the post's
+`originVideoKey`. Original CDN requests omit the share-page referrer, which can
+cause HTTP 403 for `rednote.com` shares. If the original fails, the bot refreshes
+the share page once and retries verified original sources. It never substitutes
+an unverified playback or yt-dlp video, because those copies may include a
+profile badge or platform logo. If an original is missing or blocked, the bot
+explains why it cannot supply a clean source. Audio and later HD downloads reuse
+the original. Failed manual downloads keep their buttons usable until the
+selection expires.
 
-Some playback streams include platform branding. Private, removed, login-only,
-region-restricted, and oversized videos can still fail. A successful build or
+Graphics already embedded in the creator's original footage are preserved.
+Private, removed, login-only, region-restricted, and oversized videos can still
+fail. A successful build or
 deployment does not establish that a particular post is accessible from the
 server; test its original share link after deployment.

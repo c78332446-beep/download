@@ -328,6 +328,23 @@ function buildDirectHeaders(pageUrl, headers) {
   };
 }
 
+function buildOriginalHeaders(headers) {
+  // The original CDN rejects rednote.com share-page referrers with HTTP 403.
+  return Object.fromEntries(Object.entries({ ...headers, Accept: "*/*" })
+    .filter(([name]) => name.toLowerCase() !== "referer"));
+}
+
+export function requireRedNoteOriginalSources(sources) {
+  const originals = (Array.isArray(sources) ? sources : [])
+    .filter((source) => source?.isOriginal === true && source.directUrl);
+  if (!originals.length) {
+    throw Object.assign(new Error("RedNote original is unavailable. Playback copies may contain a profile badge or logo."), {
+      code: "REDNOTE_ORIGINAL_UNAVAILABLE",
+    });
+  }
+  return originals;
+}
+
 function getMediaUrlKey(value) {
   try {
     const parsed = new URL(value);
@@ -363,7 +380,7 @@ export function extractRedNoteSourcesFromHtml(html, pageUrl, headers = REDNOTE_H
       label,
       directUrl,
       alternateUrls: [...new Set(validAlternates)],
-      headers: directHeaders,
+      headers: isOriginal ? buildOriginalHeaders(headers) : directHeaders,
       isOriginal,
     });
   };

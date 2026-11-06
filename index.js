@@ -12,6 +12,7 @@ import TelegramBot from "node-telegram-bot-api";
 import {
   getRedNoteFallbackSources,
   isRedNoteUrl,
+  requireRedNoteOriginalSources,
   REDNOTE_MOBILE_HEADERS,
 } from "./rednote.js";
 import { resolveFinalUrl as resolveHttpFinalUrl } from "./url-resolver.js";
@@ -577,7 +578,7 @@ function pickMatchingDirectChoice(targetChoice, choices = []) {
   const original = choices.find((choice) => choice?.isOriginal);
   if (original) return original;
   if (targetChoice.isOriginal) {
-    return choices[getBestDirectChoiceIndex(choices)] || choices[0];
+    throw new Error("RedNote original is unavailable. Playback copies may contain a profile badge or logo.");
   }
 
   const normalizedText = String(targetChoice?.text || "").trim().toLowerCase();
@@ -662,7 +663,7 @@ async function downloadKuaishouDirectFileWithRetry(selection, choice, filePath) 
 async function downloadRedNoteDirectFileWithRetry(selection, choice, filePath) {
   let lastError;
   const downloadChoices = async (choices) => {
-    const remaining = [...choices];
+    const remaining = choices.filter((candidate) => candidate?.isOriginal === true);
     const attempted = new Set();
     while (remaining.length) {
       const index = attempted.size === 0 ? 0 : getBestDirectChoiceIndex(remaining);
@@ -690,7 +691,7 @@ async function downloadRedNoteDirectFileWithRetry(selection, choice, filePath) {
       } catch (error) {
         if (error.code === "MEDIA_TOO_LARGE") throw error;
         lastError = error;
-        log(`[fallback] RedNote ${candidate.text} download failed; trying another stream. ${error.message}`);
+        log(`[fallback] RedNote original download failed; trying another original source. ${error.message}`);
       }
     }
     return false;
@@ -698,19 +699,19 @@ async function downloadRedNoteDirectFileWithRetry(selection, choice, filePath) {
 
   if (await downloadChoices([choice, ...selection.choices])) return;
 
-  log("[fallback] RedNote cached streams failed; refreshing video URLs once.");
+  log("[fallback] RedNote original failed; refreshing original video URLs once.");
   const refreshed = await getRedNoteFallbackSources(selection.originalUrl, selection.finalUrl, {
     timeoutMs: REDIRECT_TIMEOUT_MS,
     logger: log,
   });
-  const refreshedChoices = mapDirectSourcesToChoices(refreshed.sources);
+  const refreshedChoices = mapDirectSourcesToChoices(requireRedNoteOriginalSources(refreshed.sources));
   if (refreshed.pageUrl) selection.finalUrl = refreshed.pageUrl;
   selection.choices = refreshedChoices;
   selection.hdChoiceIndex = getBestDirectChoiceIndex(refreshedChoices);
   const preferred = refreshedChoices[selection.hdChoiceIndex];
   if (await downloadChoices([preferred, ...refreshedChoices])) return;
 
-  throw lastError || new Error("RedNote did not provide an accessible video stream.");
+  throw new Error("RedNote original is unavailable. Playback copies may contain a profile badge or logo.", { cause: lastError });
 }
 
 function getDouyinFallbackSources(inputUrl, finalUrl) {
@@ -1515,7 +1516,9 @@ async function handleSelectionDownload(
         selection.finalUrl = refreshed.pageUrl;
       }
 
-      const refreshedChoices = mapDirectSourcesToChoices(refreshed.sources);
+      const refreshedChoices = mapDirectSourcesToChoices(isRedNoteSelection
+        ? requireRedNoteOriginalSources(refreshed.sources)
+        : refreshed.sources);
       const selectedDirectChoice = downloadKind === "audio"
         ? refreshedChoices[getBestDirectChoiceIndex(refreshedChoices)]
         : pickMatchingDirectChoice(choice, refreshedChoices);
@@ -1553,7 +1556,10 @@ async function handleSelectionDownload(
       return;
     }
 
-    if (choice.kind === "audio" && selection.sourceType === "direct" && choice.directUrl) {
+    if (isRedNoteSelection && (selection.sourceType !== "direct" || !choice.isOriginal)) {
+      // An unverified yt-dlp or cached playback choice must never reach upload.
+      await downloadFromFreshPlatformSource(choice.kind === "audio" ? "audio" : "video");
+    } else if (choice.kind === "audio" && selection.sourceType === "direct" && choice.directUrl) {
       const sourceVideoPath = path.join(DOWNLOAD_DIR, `${baseName}.source.mp4`);
       downloadedFilePath = path.join(DOWNLOAD_DIR, `${baseName}.mp3`);
       temporaryFilePaths.push(sourceVideoPath);
@@ -1707,6 +1713,10 @@ async function handleSelectionDownload(
 function getFriendlyErrorMessage(errorText) {
   const text = errorText.toLowerCase();
 
+  if (text.includes("rednote original is unavailable")) {
+    return "A downloadable RedNote original is unavailable. To avoid sending a profile badge or logo, this video was not downloaded. Try a fresh share link.";
+  }
+
   if (text.includes("douyin")) {
     if (text.includes("photo-only")) {
       return "This Douyin post contains photos but no downloadable video.";
@@ -1856,7 +1866,7 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
         timeoutMs: REDIRECT_TIMEOUT_MS,
         logger: log,
       });
-      choices = mapDirectSourcesToChoices(fallback.sources);
+      choices = mapDirectSourcesToChoices(requireRedNoteOriginalSources(fallback.sources));
       if (!previewImageUrl) {
         previewImageUrl = fallback.thumbnailUrl;
       }
@@ -1868,11 +1878,7 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
 
     // Inspect RedNote's original asset before yt-dlp selects a playback rendition.
     if (shouldTryRedNoteFallback) {
-      try {
-        await useRedNoteFallback();
-      } catch (error) {
-        log(`[fallback] RedNote page extraction failed; trying yt-dlp. ${error.message}`);
-      }
+      await useRedNoteFallback();
     }
 
     try {
@@ -1992,6 +1998,7 @@ async function processIncomingUrl(chatId, extractedUrl, originalText) {
           directUrl: bestDirectChoice.directUrl,
           alternateUrls: bestDirectChoice.alternateUrls,
           headers: bestDirectChoice.headers,
+          isOriginal: bestDirectChoice.isOriginal,
         }
         : null;
 

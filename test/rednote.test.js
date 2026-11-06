@@ -8,6 +8,7 @@ import {
   extractRedNoteSourcesFromHtml,
   getRedNoteFallbackSources,
   isRedNoteUrl,
+  requireRedNoteOriginalSources,
   REDNOTE_HEADERS,
   REDNOTE_MOBILE_HEADERS,
 } from "../rednote.js";
@@ -234,9 +235,18 @@ test("RedNote exposes the original even when playback streams are available", ()
   const original = sources.find((source) => source.isOriginal);
   assert.equal(original.label, "Original");
   assert.equal(original.directUrl, "https://sns-video-bd.xhscdn.com/pre_post/clean-original");
+  assert.equal(original.headers.Referer, undefined);
+  assert.equal(original.headers.Accept, "*/*");
   // Never retry a badged playback rendition as an alternate for the original.
   assert.deepEqual(original.alternateUrls, []);
   assert.equal(sources.find((source) => source.label === "720p").isOriginal, false);
+});
+
+test("RedNote original policy rejects playback streams even when labelled Original", () => {
+  const playback = { label: "Original", directUrl: "https://example.com/branded.mp4" };
+  assert.throws(() => requireRedNoteOriginalSources([playback]), { code: "REDNOTE_ORIGINAL_UNAVAILABLE" });
+  const original = { ...playback, directUrl: "https://example.com/original.mp4", isOriginal: true };
+  assert.deepEqual(requireRedNoteOriginalSources([playback, original]), [original]);
 });
 
 test("RedNote extracts original-only posts from both consumer field shapes", () => {

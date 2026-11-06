@@ -17,14 +17,14 @@ const inputUrl = "http://xhslink.com/o/offlineTest";
 const pageUrl = `https://www.rednote.com/discovery/item/${noteId}?xsec_token=test`;
 const originalUrl = "https://sns-video-bd.xhscdn.com/pre_post/original";
 const playbackUrl = "https://media.example/playback.mp4";
-const freshUrl = "https://media.example/fresh.mp4";
+const freshUrl = "https://sns-video-bd.xhscdn.com/pre_post/fresh-original";
 const backupUrl = "https://backup.example/playback.mp4";
 const videoBytes = Buffer.from("\x00\x00\x00\x18ftypmp42-offline-rednote-video");
 
-function videoPage(url = playbackUrl, backupUrls = [], includeOriginal = true) {
+function videoPage(url = playbackUrl, backupUrls = [], includeOriginal = true, freshOriginal = false) {
   return `<script>window.__INITIAL_STATE__=${JSON.stringify({ note: { noteDetailMap: {
     [noteId]: { note: { noteId, type: "video", video: {
-      ...(includeOriginal ? { consumer: { originVideoKey: "pre_post/original" } } : {}),
+      ...(includeOriginal ? { consumer: { originVideoKey: freshOriginal ? "pre_post/fresh-original" : "pre_post/original" } } : {}),
       media: { stream: { h264: [{ width: 720, height: 1280, masterUrl: url, backupUrls }] } },
     } } },
   } } })};</script>`;
@@ -34,28 +34,32 @@ function mockBot(t, scenario) {
   const messages = [];
   const uploads = [];
   const requests = [];
-  const state = { pageFetches: 0, allowMedia: false, card: null };
+  const state = { pageFetches: 0, allowMedia: false, card: null, spawns: 0 };
   const previousAdapter = axios.defaults.adapter;
   axios.defaults.adapter = async (config) => {
     assert.ok(config.url === inputUrl || config.url === pageUrl ||
       [originalUrl, playbackUrl, freshUrl, backupUrl].includes(config.url), `Unexpected request: ${config.url}`);
     requests.push(config.url);
+    assert.ok(![playbackUrl, backupUrl].includes(config.url), "A branded playback stream must never be downloaded");
     let data;
     let headers = { "content-type": "text/html" };
     if (config.url === inputUrl && config.responseType === "stream") {
       data = Readable.from(["resolved"]);
     } else if (config.url === inputUrl || config.url === pageUrl) {
       state.pageFetches += 1;
-      data = videoPage(
-        scenario === "all cached sources expire" && state.pageFetches > 1 ? freshUrl : playbackUrl,
-        scenario === "CDN backup" ? [backupUrl] : [],
-        scenario !== "CDN backup" && !(scenario === "all cached sources expire" && state.pageFetches > 1)
+      data = scenario === "page shell only" ? "<html>No verified original</html>" : videoPage(
+        playbackUrl,
+        [backupUrl],
+        scenario !== "only branded playback" && !(scenario === "original disappears" && state.pageFetches > 1),
+        scenario === "expired original" && state.pageFetches > 1
       );
     } else {
+      assert.equal(config.headers.Referer, undefined, "The original CDN rejects share-page referrers");
+      assert.equal(config.headers.referer, undefined);
+      assert.equal(config.headers.Accept, "*/*");
       const blocked = scenario === "all blocked" ? !state.allowMedia
-        : scenario === "CDN backup" ? config.url !== backupUrl
-          : scenario === "all cached sources expire" ? config.url !== freshUrl
-            : config.url === originalUrl;
+        : ["original blocked", "original disappears"].includes(scenario) ||
+          scenario === "expired original" && config.url !== freshUrl;
       if (blocked) {
         const response = { data: Readable.from(["Forbidden"]), status: 403, config };
         throw Object.assign(new Error("Request failed with status code 403"), { response });
@@ -84,7 +88,8 @@ function mockBot(t, scenario) {
   }
   t.mock.method(bot, "sendDocument", async () => assert.fail("media upload should succeed"));
   t.mock.method(childProcess, "spawn", (binary, args) => {
-    assert.ok(args.includes("-acodec"), "yt-dlp must not run when a RedNote stream is available");
+    state.spawns += 1;
+    assert.ok(args.includes("-acodec"), "yt-dlp must not bypass RedNote original verification");
     const child = new EventEmitter();
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
@@ -99,7 +104,7 @@ function mockBot(t, scenario) {
   return { messages, uploads, requests, state };
 }
 
-for (const scenario of ["original blocked", "all cached sources expire", "CDN backup"]) {
+for (const scenario of ["original available", "expired original"]) {
   test(`RedNote AUTO_DOWNLOAD sends video when ${scenario}`, async (t) => {
     const { messages, uploads, requests, state } = mockBot(t, scenario);
     await processIncomingUrl(42, inputUrl, inputUrl);
@@ -107,18 +112,29 @@ for (const scenario of ["original blocked", "all cached sources expire", "CDN ba
     assert.equal(uploads[0].method, "sendVideo");
     assert.deepEqual(uploads[0].bytes, videoBytes);
     assert.equal(uploads[0].options.supports_streaming, true);
-    assert.equal(state.pageFetches, scenario === "all cached sources expire" ? 2 : 1);
-    if (scenario === "original blocked") {
-      assert.ok(requests.indexOf(originalUrl) < requests.indexOf(playbackUrl));
-      assert.equal(requests.filter((url) => url === originalUrl).length, 1);
-    }
-    if (scenario === "CDN backup") assert.ok(requests.includes(backupUrl));
+    assert.equal(state.pageFetches, scenario === "expired original" ? 2 : 1);
+    assert.ok(requests.includes(originalUrl));
+    if (scenario === "expired original") assert.ok(requests.includes(freshUrl));
+    assert.equal(state.spawns, 0);
+    assert.equal(requests.some((url) => [playbackUrl, backupUrl].includes(url)), false);
     await assert.rejects(fs.stat(uploads[0].filePath), { code: "ENOENT" });
   });
 }
 
-test("RedNote audio reuses the working playback stream after original access fails", async (t) => {
-  const { uploads, requests, state } = mockBot(t, "original blocked");
+for (const scenario of ["original blocked", "original disappears", "only branded playback", "page shell only"]) {
+  test(`RedNote refuses branded video when ${scenario}`, async (t) => {
+    const { messages, uploads, requests, state } = mockBot(t, scenario);
+    await processIncomingUrl(42, inputUrl, inputUrl);
+    assert.equal(uploads.length, 0);
+    assert.equal(requests.some((url) => [playbackUrl, backupUrl].includes(url)), false);
+    assert.equal(state.spawns, 0);
+    if (scenario !== "page shell only") assert.match(messages.at(-1), /original is unavailable.*profile badge or logo/);
+    if (scenario === "original blocked") assert.equal(requests.filter((url) => url === originalUrl).length, 2);
+  });
+}
+
+test("RedNote audio reuses the original without falling back to branded playback", async (t) => {
+  const { uploads, requests, state } = mockBot(t, "original available");
   await processIncomingUrl(42, inputUrl, inputUrl);
   const callbackData = state.card.inline_keyboard.flat().find((button) => button.text === "Audio").callback_data;
   const callback = bot.listeners("callback_query")[0];
@@ -126,7 +142,8 @@ test("RedNote audio reuses the working playback stream after original access fai
   assert.equal(uploads.length, 2);
   assert.equal(uploads[1].method, "sendAudio");
   assert.deepEqual(uploads[1].bytes, Buffer.from("ID3-offline-audio"));
-  assert.equal(requests.filter((url) => url === originalUrl).length, 1);
+  assert.equal(requests.filter((url) => url === originalUrl).length, 2);
+  assert.equal(state.pageFetches, 1);
   await assert.rejects(fs.stat(uploads[1].filePath), { code: "ENOENT" });
 });
 
