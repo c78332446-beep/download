@@ -14,10 +14,16 @@ export async function downloadDirectFile(url, filePath, headers, {
   maxBytes = Infinity,
   httpClient = axios,
 } = {}) {
-  const response = await httpClient({
-    method: "GET", url, responseType: "stream", timeout: 60000, headers,
-    validateStatus: (status) => status >= 200 && status < 300,
-  });
+  let response;
+  try {
+    response = await httpClient({
+      method: "GET", url, responseType: "stream", timeout: 60000, headers,
+      validateStatus: (status) => status >= 200 && status < 300,
+    });
+  } catch (error) {
+    error.response?.data?.destroy?.();
+    throw error;
+  }
   const contentType = String(response.headers?.["content-type"] || "");
   if (/(?:text\/|json|xml|javascript)/i.test(contentType)) {
     response.data.destroy();

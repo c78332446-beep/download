@@ -577,7 +577,7 @@ function pickMatchingDirectChoice(targetChoice, choices = []) {
   const original = choices.find((choice) => choice?.isOriginal);
   if (original) return original;
   if (targetChoice.isOriginal) {
-    throw new Error("RedNote original video is no longer available. Send the link again.");
+    return choices[getBestDirectChoiceIndex(choices)] || choices[0];
   }
 
   const normalizedText = String(targetChoice?.text || "").trim().toLowerCase();
@@ -660,36 +660,57 @@ async function downloadKuaishouDirectFileWithRetry(selection, choice, filePath) 
 }
 
 async function downloadRedNoteDirectFileWithRetry(selection, choice, filePath) {
-  try {
-    await downloadDirectChoice(choice, filePath);
-  } catch (error) {
-    if (
-      !isRedNoteUrl(selection?.originalUrl) &&
-      !isRedNoteUrl(selection?.finalUrl)
-    ) {
-      throw error;
-    }
-
-    log(`[fallback] RedNote direct download failed; refreshing source. ${error.message}`);
-    const refreshed = await getRedNoteFallbackSources(
-      selection.originalUrl,
-      selection.finalUrl,
-      {
-        timeoutMs: REDIRECT_TIMEOUT_MS,
-        logger: log,
+  let lastError;
+  const downloadChoices = async (choices) => {
+    const remaining = [...choices];
+    const attempted = new Set();
+    while (remaining.length) {
+      const index = attempted.size === 0 ? 0 : getBestDirectChoiceIndex(remaining);
+      const candidate = remaining.splice(index, 1)[0];
+      if (!candidate?.directUrl) continue;
+      const key = JSON.stringify([candidate.directUrl, candidate.alternateUrls || []]);
+      if (attempted.has(key)) continue;
+      attempted.add(key);
+      try {
+        await downloadDirectChoice(candidate, filePath);
+        // Reuse the working stream for later HD/audio button presses.
+        const kind = choice.kind;
+        Object.assign(choice, candidate, { kind, text: kind === "audio" ? "Audio" : candidate.text });
+        const workingIndex = selection.choices.findIndex((entry) => entry.directUrl === candidate.directUrl);
+        if (workingIndex >= 0) selection.hdChoiceIndex = workingIndex;
+        if (selection.audioChoice) {
+          Object.assign(selection.audioChoice, {
+            directUrl: candidate.directUrl,
+            alternateUrls: candidate.alternateUrls,
+            headers: candidate.headers,
+            isOriginal: candidate.isOriginal,
+          });
+        }
+        return true;
+      } catch (error) {
+        if (error.code === "MEDIA_TOO_LARGE") throw error;
+        lastError = error;
+        log(`[fallback] RedNote ${candidate.text} download failed; trying another stream. ${error.message}`);
       }
-    );
-    const refreshedChoices = mapDirectSourcesToChoices(refreshed.sources);
-    const retryChoice = choice.kind === "audio"
-      ? refreshedChoices[getBestDirectChoiceIndex(refreshedChoices)]
-      : pickMatchingDirectChoice(choice, refreshedChoices);
-
-    if (!retryChoice?.directUrl) {
-      throw error;
     }
+    return false;
+  };
 
-    await downloadDirectChoice(retryChoice, filePath);
-  }
+  if (await downloadChoices([choice, ...selection.choices])) return;
+
+  log("[fallback] RedNote cached streams failed; refreshing video URLs once.");
+  const refreshed = await getRedNoteFallbackSources(selection.originalUrl, selection.finalUrl, {
+    timeoutMs: REDIRECT_TIMEOUT_MS,
+    logger: log,
+  });
+  const refreshedChoices = mapDirectSourcesToChoices(refreshed.sources);
+  if (refreshed.pageUrl) selection.finalUrl = refreshed.pageUrl;
+  selection.choices = refreshedChoices;
+  selection.hdChoiceIndex = getBestDirectChoiceIndex(refreshedChoices);
+  const preferred = refreshedChoices[selection.hdChoiceIndex];
+  if (await downloadChoices([preferred, ...refreshedChoices])) return;
+
+  throw lastError || new Error("RedNote did not provide an accessible video stream.");
 }
 
 function getDouyinFallbackSources(inputUrl, finalUrl) {
@@ -1656,7 +1677,7 @@ async function handleSelectionDownload(
       latestSelection.downloading = false;
     }
 
-    if (!options.keepSelection) {
+    if (!options.keepSelection && sentMediaMessage?.message_id) {
       cleanupSelection(selectionId);
     }
     await safeDeleteMessages(chatId, cleanupMessageIds);

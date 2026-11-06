@@ -24,7 +24,8 @@ RUN npm ci --omit=dev \
 
 COPY . .
 
-RUN mkdir -p /app/downloads \
+RUN npm run build \
+    && mkdir -p /app/downloads \
     && chown -R node:node /app
 
 USER node

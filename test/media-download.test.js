@@ -12,6 +12,8 @@ test("direct downloads reject access pages and empty media, enforce stream limit
   const server = http.createServer((request, response) => {
     if (request.url === "/redirect") {
       response.writeHead(302, { Location: "/video" }).end();
+    } else if (request.url === "/forbidden") {
+      response.writeHead(403, { "Content-Type": "text/plain" }).end("Forbidden");
     } else if (request.url === "/html") {
       response.writeHead(200, { "Content-Type": "text/html" }).end("<html>Access denied</html>");
     } else if (request.url === "/hidden-html") {
@@ -35,6 +37,11 @@ test("direct downloads reject access pages and empty media, enforce stream limit
     await fs.rm(directory, { recursive: true, force: true });
   });
   const base = `http://127.0.0.1:${server.address().port}`;
+  await assert.rejects(downloadDirectFile(`${base}/forbidden`, output), (error) => {
+    assert.equal(error.response.status, 403);
+    assert.equal(error.response.data.destroyed, true);
+    return true;
+  });
   for (const route of ["/html", "/hidden-html", "/empty"]) {
     await assert.rejects(downloadDirectFile(`${base}${route}`, output), /web page|empty video/);
     await assert.rejects(fs.stat(output), { code: "ENOENT" });
