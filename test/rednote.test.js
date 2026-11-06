@@ -25,6 +25,7 @@ async function closeServer(server) {
 test("RedNote URL recognition accepts platform hosts and rejects lookalikes", () => {
   const accepted = [
     "http://xhslink.com/o/89by8DBQW4X",
+    "http://xhslink.com/o/7G2d9ZmDIzz",
     "https://WWW.XHSLINK.COM/o/89by8DBQW4X",
     `https://www.xiaohongshu.com/discovery/item/${SAMPLE_NOTE_ID}?xsec_token=abc`,
     `https://xiaohongshu.com/explore/${SAMPLE_NOTE_ID}`,
@@ -380,4 +381,91 @@ test("RedNote feed redirects cannot substitute a different hydrated post", () =>
     ),
     /requested post/i
   );
+});
+
+test("RedNote desktop state supports serialized collections without changing string values", () => {
+  const html = buildVideoFixture()
+    .replace('"global":{"firstVisitUrl":undefined}',
+      '"global":{"firstVisitUrl":undefined,"sets":new Set([]),"maps":new Map([]),"text":"undefined new Set([]) new Map([])"}')
+    .replace("demo_258.mp4?", "new Set([]).mp4?");
+  const { sources } = extractRedNoteSourcesFromHtml(html,
+    `https://www.rednote.com/explore/${SAMPLE_NOTE_ID}`);
+  assert.equal(sources.length, 1);
+  assert.match(sources[0].directUrl, /\/new Set\(\[\]\)\.mp4\?/);
+  assert.throws(() => extractRedNoteSourcesFromHtml(
+    html.replace("new Set([])", "new Set(doSomething())"),
+    `https://www.rednote.com/explore/${SAMPLE_NOTE_ID}`
+  ), /parse failed/);
+});
+
+test("RedNote recovers signed mobile paths from error and login redirects", async () => {
+  const signedPath = `/discovery/item/${SAMPLE_NOTE_ID}?xsec_token=a%2Bb%3D&xsec_source=app_share`;
+  const redirects = [
+    `https://www.rednote.com/404?noteId=${SAMPLE_NOTE_ID}&xsec_token=a%2Bb%3D&xsec_source=app_share&errorCode=-510001&source=note`,
+    `https://www.rednote.com/404?redirectPath=${encodeURIComponent(encodeURIComponent(signedPath))}`,
+    `https://www.rednote.com/login?redirectPath=${encodeURIComponent(`https://www.rednote.com${signedPath}`)}`,
+  ];
+  for (const redirectedUrl of redirects) {
+    assert.equal(extractRedNotePostId(redirectedUrl), SAMPLE_NOTE_ID);
+    const calls = [];
+    const result = await getRedNoteFallbackSources("http://xhslink.com/o/7G2d9ZmDIzz", null, {
+      httpClient: async (config) => {
+        calls.push(config.url);
+        return calls.length === 1
+          ? { status: 200, data: "<html>Unavailable</html>", request: { res: { responseUrl: redirectedUrl } } }
+          : { status: 200, data: buildVideoFixture() };
+      },
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(result.noteId, SAMPLE_NOTE_ID);
+    const recoveredUrl = new URL(calls[1]);
+    assert.equal(recoveredUrl.hostname, "www.rednote.com");
+    assert.equal(recoveredUrl.pathname, `/discovery/item/${SAMPLE_NOTE_ID}`);
+    assert.equal(recoveredUrl.searchParams.get("xsec_token"), "a+b=");
+    assert.equal(recoveredUrl.searchParams.get("xsec_source"), "app_share");
+    for (const key of ["noteId", "redirectPath", "errorCode", "source"]) {
+      assert.equal(recoveredUrl.searchParams.has(key), false);
+    }
+  }
+});
+
+test("RedNote reports platform unavailability instead of parsing its error-page state", async () => {
+  let calls = 0;
+  await assert.rejects(getRedNoteFallbackSources("http://xhslink.com/o/7G2d9ZmDIzz", null, {
+    httpClient: async () => {
+      calls += 1;
+      return {
+        status: 200,
+        // Error pages must not provide a recommended video as the requested post.
+        data: buildVideoFixture(),
+        request: { res: { responseUrl: `https://www.rednote.com/404?noteId=${SAMPLE_NOTE_ID}&errorCode=-510001` } },
+      };
+    },
+  }), /RedNote post is unavailable.*fresh video share link/);
+  assert.equal(calls, 4);
+});
+
+test("RedNote retains the input post identity when a redirect points at another post", async () => {
+  const requestedId = "111111111111111111111111";
+  await assert.rejects(getRedNoteFallbackSources(
+    `https://www.rednote.com/discovery/item/${requestedId}`,
+    null,
+    {
+      httpClient: async () => ({
+        status: 200, data: buildVideoFixture(),
+        request: { res: { responseUrl: `https://www.rednote.com/explore/${SAMPLE_NOTE_ID}` } },
+      }),
+    }
+  ), /requested post/);
+});
+
+test("RedNote refuses external login redirect targets", async () => {
+  const loginUrl = `https://www.rednote.com/login?redirectPath=${encodeURIComponent(`https://evil.example/discovery/item/${SAMPLE_NOTE_ID}`)}`;
+  assert.equal(extractRedNotePostId(loginUrl), null);
+  await assert.rejects(getRedNoteFallbackSources(loginUrl, loginUrl, {
+    httpClient: async (config) => {
+      assert.equal(config.url, loginUrl);
+      return { status: 200, data: buildVideoFixture() };
+    },
+  }), /RedNote login required/);
 });

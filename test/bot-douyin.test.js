@@ -97,3 +97,8 @@ test("Douyin blocked and expired-link errors are specific instead of generic", (
   assert.match(getFriendlyErrorMessage("Douyin share link did not resolve to a video."), /fresh video share link/);
   assert.match(getFriendlyErrorMessage("Douyin post is photo-only and has no downloadable video."), /photos/);
 });
+
+test("RedNote unavailable posts ask for a fresh app share link", () => {
+  assert.match(getFriendlyErrorMessage("RedNote post is unavailable."), /fresh video share link/);
+  assert.match(getFriendlyErrorMessage("RedNote login required to access this post."), /login\/cookies/);
+});

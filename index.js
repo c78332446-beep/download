@@ -1707,6 +1707,10 @@ function getFriendlyErrorMessage(errorText) {
     return "The media link returned no video or an access-check page. Send the original share link again to refresh it.";
   }
 
+  if (text.includes("rednote") && text.includes("post is unavailable")) {
+    return "RedNote says this post is unavailable. Copy a fresh video share link from the RedNote/Xiaohongshu app and send it again. The post may be removed or restricted in this server's region.";
+  }
+
   if (text.includes("unsupported url")) {
     return "This link format is not currently supported by yt-dlp.";
   }

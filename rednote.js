@@ -40,8 +40,9 @@ export function isRedNoteUrl(value) {
   }
 }
 
-export function extractRedNotePostId(value) {
+export function extractRedNotePostId(value, depth = 0) {
   if (typeof value !== "string") return null;
+  if (depth > 3) return null;
 
   try {
     const parsed = new URL(value);
@@ -49,11 +50,50 @@ export function extractRedNotePostId(value) {
       /\/(?:explore|discovery\/item|note)\/([\da-f]{24})(?:\/|$)/i
     );
     if (match) return match[1];
-    const targetId = parsed.searchParams.get("target_note_id");
-    return /^[\da-f]{24}$/i.test(targetId || "") ? targetId : null;
+    for (const key of ["target_note_id", "noteId", "note_id"]) {
+      const targetId = parsed.searchParams.get(key);
+      if (/^[\da-f]{24}$/i.test(targetId || "")) return targetId;
+    }
+    const redirectUrl = getRedNoteRedirectUrl(parsed);
+    return redirectUrl ? extractRedNotePostId(redirectUrl.href, depth + 1) : null;
   } catch {
     return null;
   }
+}
+
+function getRedNoteRedirectUrl(pageUrl) {
+  let target = pageUrl.searchParams.get("redirectPath");
+  if (!target) return null;
+  // Mobile error pages can encode the signed path twice.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const url = new URL(target, pageUrl);
+      if (isRedNoteUrl(url.href) && /^\/(?:discovery\/item|explore|note)\//i.test(url.pathname)) {
+        return url;
+      }
+      const decoded = decodeURIComponent(target);
+      if (decoded === target) break;
+      target = decoded;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function getRedNoteMobileUrl(value, requestedId) {
+  if (!isRedNoteUrl(value)) return null;
+  const pageUrl = new URL(value);
+  if (isSameOrSubdomain(pageUrl.hostname.toLowerCase().replace(/\.$/, ""), "xhslink.com")) return null;
+  const mobileUrl = getRedNoteRedirectUrl(pageUrl) || pageUrl;
+  const noteId = requestedId || extractRedNotePostId(mobileUrl.href);
+  if (!noteId) return null;
+  mobileUrl.pathname = `/discovery/item/${noteId}`;
+  for (const key of ["target_note_id", "undertake_note_error", "noteId", "note_id", "errorCode", "source", "redirectPath"]) {
+    mobileUrl.searchParams.delete(key);
+  }
+  mobileUrl.hash = "";
+  return mobileUrl.href;
 }
 
 function escapeRegExp(value) {
@@ -87,6 +127,16 @@ function normalizeJsonLikeSource(source) {
     }
 
     const previousChar = source[index - 1] || "";
+    // Current desktop pages serialize unrelated stores as empty Set/Map values.
+    // Normalize these literal forms without evaluating any page JavaScript.
+    const emptyCollection = char === "n"
+      ? source.slice(index).match(/^new\s+(Set|Map)\s*\(\s*\[\s*\]\s*\)/)
+      : null;
+    if (emptyCollection && !/[a-zA-Z0-9_$]/.test(previousChar)) {
+      output += emptyCollection[1] === "Set" ? "[]" : "{}";
+      index += emptyCollection[0].length - 1;
+      continue;
+    }
     const afterUndefined = source[index + "undefined".length] || "";
     if (
       source.startsWith("undefined", index) &&
@@ -187,6 +237,10 @@ function pickRedNoteEntry(initialState, pageUrl) {
             entry?.note?.note_id === requestedId
         );
       if (requestedEntry?.note) {
+        const noteId = requestedEntry.note.noteId || requestedEntry.note.note_id;
+        if (noteId && noteId !== requestedId) {
+          throw new Error("RedNote fallback note detail did not match the requested post.");
+        }
         return requestedEntry;
       }
       throw new Error("RedNote fallback note detail did not contain the requested post.");
@@ -390,27 +444,21 @@ export async function getRedNoteFallbackSources(
   // Desktop redirects can land on /explore with only target_note_id left.
   // Rebuild the mobile share path while retaining the signed query parameters.
   const candidates = [];
+  let requestedId = extractRedNotePostId(inputUrl) || extractRedNotePostId(finalUrl);
+  const addCandidate = (value) => {
+    if (candidates.length < 8 && isRedNoteUrl(value) && !candidates.includes(value)) candidates.push(value);
+  };
   for (const value of [finalUrl, inputUrl].filter(Boolean)) {
-    if (
-      isRedNoteUrl(value) &&
-      extractRedNotePostId(value) &&
-      !new URL(value).pathname.startsWith("/discovery/item/")
-    ) {
-      const mobileUrl = new URL(value);
-      mobileUrl.pathname = `/discovery/item/${extractRedNotePostId(value)}`;
-      if (mobileUrl.searchParams.has("target_note_id")) {
-        mobileUrl.searchParams.delete("target_note_id");
-        mobileUrl.searchParams.delete("undertake_note_error");
-      }
-      candidates.push(mobileUrl.href);
-    }
-    candidates.push(value);
+    addCandidate(getRedNoteMobileUrl(value, requestedId));
+    addCandidate(value);
   }
   let lastError = null;
+  let unavailable = false;
+  let loginRequired = false;
 
   // Some public posts omit media on desktop but hydrate it on mobile.
   for (const headers of [REDNOTE_MOBILE_HEADERS, REDNOTE_HEADERS]) {
-    for (const candidateUrl of new Set(candidates)) {
+    for (const candidateUrl of candidates) {
       try {
         logger(`[fallback] RedNote page parse start: ${candidateUrl}`);
         const response = await httpClient({
@@ -422,18 +470,36 @@ export async function getRedNoteFallbackSources(
           validateStatus: () => true,
         });
 
+        const pageUrl = getAxiosResponseUrl(response, candidateUrl);
+        if (!isRedNoteUrl(pageUrl)) {
+          throw new Error("RedNote fallback redirected outside the platform.");
+        }
+        requestedId ||= extractRedNotePostId(pageUrl);
+        // A short link may first reveal its signed post inside an error redirect.
+        addCandidate(getRedNoteMobileUrl(pageUrl, requestedId));
+        const pathname = new URL(pageUrl).pathname;
+        if (/^\/404(?:\/|$)/i.test(pathname)) {
+          unavailable = true;
+          throw new Error("RedNote post is unavailable on the share page.");
+        }
+        if (/^\/login(?:\/|$)/i.test(pathname)) {
+          loginRequired = true;
+          throw new Error("RedNote login required to access this post.");
+        }
         if (response.status >= 400 || typeof response.data !== "string") {
           throw new Error(`RedNote fallback page fetch failed (status ${response.status}).`);
         }
 
-        const pageUrl = getAxiosResponseUrl(response, candidateUrl);
-        const extracted = extractRedNoteSourcesFromHtml(response.data, pageUrl, headers);
+        // Keep the requested identity even if the response is a feed or short URL.
+        const identityUrl = getRedNoteMobileUrl(pageUrl, requestedId) ||
+          (requestedId ? `https://www.xiaohongshu.com/discovery/item/${requestedId}` : pageUrl);
+        const extracted = extractRedNoteSourcesFromHtml(response.data, identityUrl, headers);
         logger(
           `[fallback] RedNote video URL extracted (${extracted.sources.length} source(s)).`
         );
         return {
           ...extracted,
-          pageUrl,
+          pageUrl: identityUrl,
         };
       } catch (error) {
         lastError = error;
@@ -442,5 +508,9 @@ export async function getRedNoteFallbackSources(
     }
   }
 
+  if (unavailable) {
+    throw new Error("RedNote post is unavailable. Copy a fresh video share link from the RedNote/Xiaohongshu app; the post may be removed or region-restricted.");
+  }
+  if (loginRequired) throw new Error("RedNote login required to access this post.");
   throw lastError || new Error("RedNote fallback could not extract a playable video.");
 }
